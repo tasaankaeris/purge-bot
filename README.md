@@ -34,11 +34,19 @@ Welcome to **PurgeBot**! This bot helps manage and clean up your Discord server 
 
 3. **Set up your environment:**
 
-    Create a `.env` file in the root directory with the following content:
+    Provide your Discord bot token in one of these ways:
 
-    ```env
-    DISCORD_KEY=your-discord-bot-token
-    ```
+    - **Option A:** Set the `DISCORD_KEY` environment variable (no .env file required):
+      ```bash
+      export DISCORD_KEY=your-discord-bot-token   # Linux/macOS
+      set DISCORD_KEY=your-discord-bot-token      # Windows cmd
+      $env:DISCORD_KEY="your-discord-bot-token"   # PowerShell
+      ```
+    - **Option B:** Create a `.env` file in the root directory (or use `-env path`):
+      ```env
+      DISCORD_KEY=your-discord-bot-token
+      ```
+      If no `-env` flag is given, the bot will try to load `.env` from the current working directory; if the file is missing, it will use environment variables instead.
 
 4. **Run the bot:**
 
@@ -48,7 +56,7 @@ Welcome to **PurgeBot**! This bot helps manage and clean up your Discord server 
 
     **Command-line options:**
     
-    - `-env` (or `-env-file`): Path to `.env` file. If omitted or empty, `.env` is loaded from the current working directory.
+    - `-env` (or `-env-file`): Path to `.env` file. If omitted or empty, the bot tries to load `.env` from the current working directory; if that file is missing, it uses existing environment variables (e.g. `DISCORD_KEY`). No .env file is required if `DISCORD_KEY` is already set in the environment.
       ```bash
       go run main.go -env /path/to/.env
       ```

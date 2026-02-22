@@ -13,23 +13,23 @@ type Config struct {
 	DBPath     string
 }
 
-// Load loads environment variables from the specified path and returns a Config.
-// If path is empty, it loads from the current working directory using godotenv.Load().
-// It validates that DISCORD_KEY is set and non-empty.
+// Load loads environment variables and returns a Config.
+// If path is non-empty, it loads from that file and returns an error if the file cannot be loaded.
+// If path is empty, it optionally loads .env from the current working directory; if no .env file
+// exists, it does not error—DISCORD_KEY may be set in the process environment instead.
+// DISCORD_KEY must be set (either from a .env file or from the environment).
 func Load(path string) (*Config, error) {
-	var err error
-	if path == "" {
-		err = godotenv.Load()
+	if path != "" {
+		if err := godotenv.Load(path); err != nil {
+			return nil, fmt.Errorf("error loading .env file: %w", err)
+		}
 	} else {
-		err = godotenv.Load(path)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("error loading .env file: %w", err)
+		_ = godotenv.Load() // optional: ignore error if .env not present
 	}
 
 	discordKey := os.Getenv("DISCORD_KEY")
 	if discordKey == "" {
-		return nil, fmt.Errorf("DISCORD_KEY is not set")
+		return nil, fmt.Errorf("DISCORD_KEY is not set (set it in your environment or use -env path to a .env file)")
 	}
 
 	dbPath := os.Getenv("DB_PATH")
