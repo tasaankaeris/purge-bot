@@ -66,6 +66,12 @@ Welcome to **PurgeBot**! This bot helps manage and clean up your Discord server 
       go run main.go -db /var/data/purge.db
       ```
     
+    - `-log-level`: Log level: `debug`, `info`, `warn`, `error`. Default: `info`. At `debug`, incoming messages and per-message deletions are logged; at `info` and above only task changes, errors, and thread cleanup summaries are logged.
+    
+    - `-log-format`: Log format: `text` or `json`. Default: `text`. Use `json` for structured logs (e.g. for log aggregation).
+    
+    - `-log-file`: Optional path to a log file. When set, logs are written to this file with size-based rotation (100 MB max, 3 backups, 28-day retention, compressed). If omitted, logs go to stderr.
+    
     **Examples:**
     
     ```bash

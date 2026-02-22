@@ -2,15 +2,23 @@ package bot
 
 import (
 	"fmt"
-	"log"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"gorm.io/gorm"
 )
+
+// Logger provides leveled logging. If nil, log calls are no-ops.
+type Logger interface {
+	Debug(msg string, keyvals ...interface{})
+	Info(msg string, keyvals ...interface{})
+	Warn(msg string, keyvals ...interface{})
+	Error(msg string, keyvals ...interface{})
+}
 
 // MessageFetcherDeleter abstracts Discord message operations for testing.
 type MessageFetcherDeleter interface {
@@ -28,6 +36,9 @@ type Bot struct {
 	minDuration        time.Duration
 	messageAPI         MessageFetcherDeleter
 	session            *discordgo.Session // Kept for non-purge operations (permissions, etc.)
+	log                Logger
+	permErrorLastLog   map[string]time.Time // channelID -> last time we logged permission error
+	permErrorMu        sync.Mutex
 }
 
 // Task represents a purge task stored in the database.
@@ -61,13 +72,14 @@ type RolePermission struct {
 // NewBot creates a new Bot instance with the provided database and message API interface.
 func NewBot(db *gorm.DB, messageAPI MessageFetcherDeleter) *Bot {
 	return &Bot{
-		activeTasks:       make(map[string]*time.Ticker),
+		activeTasks:      make(map[string]*time.Ticker),
 		activeThreadTasks: make(map[string]*time.Ticker),
-		db:                db,
-		purgeInterval:     33 * time.Second,
-		maxDuration:       3333 * 24 * time.Hour,
-		minDuration:       30 * time.Second,
-		messageAPI:        messageAPI,
+		db:               db,
+		purgeInterval:    33 * time.Second,
+		maxDuration:      3333 * 24 * time.Hour,
+		minDuration:      30 * time.Second,
+		messageAPI:       messageAPI,
+		permErrorLastLog: make(map[string]time.Time),
 	}
 }
 
@@ -76,19 +88,63 @@ func (b *Bot) SetSession(s *discordgo.Session) {
 	b.session = s
 }
 
+// SetLogger sets the logger. If nil, logging is a no-op.
+func (b *Bot) SetLogger(l Logger) {
+	b.log = l
+}
+
+func (b *Bot) logDebug(msg string, keyvals ...interface{}) {
+	if b.log != nil {
+		b.log.Debug(msg, keyvals...)
+	}
+}
+func (b *Bot) logInfo(msg string, keyvals ...interface{}) {
+	if b.log != nil {
+		b.log.Info(msg, keyvals...)
+	}
+}
+func (b *Bot) logWarn(msg string, keyvals ...interface{}) {
+	if b.log != nil {
+		b.log.Warn(msg, keyvals...)
+	}
+}
+func (b *Bot) logError(msg string, keyvals ...interface{}) {
+	if b.log != nil {
+		b.log.Error(msg, keyvals...)
+	}
+}
+
+const permErrorBackoff = 5 * time.Minute
+
+// logPermissionErrorOnce logs a permission-denied error at most once per channel per permErrorBackoff.
+func (b *Bot) logPermissionErrorOnce(channelID, guildID, userID string) {
+	if b.log == nil {
+		return
+	}
+	b.permErrorMu.Lock()
+	last := b.permErrorLastLog[channelID]
+	now := time.Now()
+	if now.Sub(last) < permErrorBackoff {
+		b.permErrorMu.Unlock()
+		return
+	}
+	b.permErrorLastLog[channelID] = now
+	b.permErrorMu.Unlock()
+	b.log.Warn("permission denied", "channel_id", channelID, "guild_id", guildID, "user_id", userID)
+}
+
 // Ready handles the Discord ready event.
 func (b *Bot) Ready(s *discordgo.Session, event *discordgo.Ready) {
-	fmt.Println("Bot is ready")
-	fmt.Printf("Logged in as: %s\n", s.State.User.Username)
+	b.logInfo("bot ready", "username", s.State.User.Username)
 
 	// AutoMigrate ThreadCleanupTask
 	if err := b.db.AutoMigrate(&ThreadCleanupTask{}); err != nil {
-		log.Println("Error migrating ThreadCleanupTask:", err)
+		b.logError("migrating ThreadCleanupTask failed", "error", err)
 	}
 
 	var tasks []Task
 	if err := b.db.Find(&tasks).Error; err != nil {
-		log.Println("Error querying tasks:", err)
+		b.logError("querying tasks failed", "error", err)
 		return
 	}
 
@@ -96,16 +152,15 @@ func (b *Bot) Ready(s *discordgo.Session, event *discordgo.Ready) {
 		channelID := task.ChannelID
 		duration := time.Duration(task.PurgeDurationSeconds) * time.Second
 
-		// Fetch channel directly from Discord API
 		channel, err := s.Channel(channelID)
 		if err != nil {
-			log.Printf("Error fetching channel %s: %v", channelID, err)
+			b.logError("fetching channel failed", "channel_id", channelID, "error", err)
 			b.deleteTaskDB(channelID)
 			continue
 		}
 
 		if channel.Type != discordgo.ChannelTypeGuildText {
-			log.Printf("Channel %s is not a text channel", channelID)
+			b.logWarn("channel is not guild text, skipping restore", "channel_id", channelID)
 			b.deleteTaskDB(channelID)
 			continue
 		}
@@ -113,10 +168,9 @@ func (b *Bot) Ready(s *discordgo.Session, event *discordgo.Ready) {
 		b.setPurgeTaskLoop(s, channelID, duration)
 	}
 
-	// Load thread cleanup tasks
 	var threadTasks []ThreadCleanupTask
 	if err := b.db.Find(&threadTasks).Error; err != nil {
-		log.Println("Error querying thread cleanup tasks:", err)
+		b.logError("querying thread cleanup tasks failed", "error", err)
 		return
 	}
 
@@ -124,32 +178,34 @@ func (b *Bot) Ready(s *discordgo.Session, event *discordgo.Ready) {
 		parentChannelID := task.ParentChannelID
 		duration := time.Duration(task.PurgeDurationSeconds) * time.Second
 
-		// Fetch channel directly from Discord API
 		channel, err := s.Channel(parentChannelID)
 		if err != nil {
-			log.Printf("Error fetching parent channel %s: %v", parentChannelID, err)
+			b.logError("fetching parent channel failed", "parent_channel_id", parentChannelID, "error", err)
 			b.deleteThreadCleanupTaskDB(parentChannelID)
 			continue
 		}
 
 		if channel.Type != discordgo.ChannelTypeGuildText {
-			log.Printf("Parent channel %s is not a text channel", parentChannelID)
+			b.logWarn("parent channel is not guild text, skipping thread restore", "parent_channel_id", parentChannelID)
 			b.deleteThreadCleanupTaskDB(parentChannelID)
 			continue
 		}
 
 		b.setThreadCleanupTaskLoop(s, parentChannelID, duration)
 	}
+
+	b.logInfo("ready: restored tasks", "message_purge_tasks", len(tasks), "thread_cleanup_tasks", len(threadTasks))
 }
 
 // MessageCreate handles incoming Discord messages.
 func (b *Bot) MessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	log.Printf("Received message from %s: %s", m.Author.ID, m.Content)
+	b.logDebug("received message", "author_id", m.Author.ID, "channel_id", m.ChannelID, "guild_id", m.GuildID, "content", m.Content)
 
 	if strings.HasPrefix(m.Content, "<@") && strings.Contains(m.Content, s.State.User.ID) {
-		log.Println("Bot mentioned in message")
+		b.logDebug("bot mentioned", "channel_id", m.ChannelID, "guild_id", m.GuildID)
 
 		if !b.isAdminOrOwner(s, m.GuildID, m.Author.ID) && !b.checkUserPermission(s, m.GuildID, m.Author.ID) {
+			b.logPermissionErrorOnce(m.ChannelID, m.GuildID, m.Author.ID)
 			s.ChannelMessageSend(m.ChannelID, "You don't have the necessary permissions to use this bot. You must be either the server owner, an administrator, or a user with special permissions assigned by an admin.")
 			return
 		}
@@ -405,14 +461,14 @@ func (b *Bot) isAdminOrOwner(s *discordgo.Session, guildID, userID string) bool 
 	// Fetch member directly if state cache is not available
 	member, err := s.GuildMember(guildID, userID)
 	if err != nil {
-		log.Println("Error fetching member from API:", err)
+		b.logError("fetching member failed", "guild_id", guildID, "user_id", userID, "error", err)
 		return false
 	}
 
 	// Fetch guild directly if state cache is not available
 	guild, err := s.Guild(guildID)
 	if err != nil {
-		log.Println("Error fetching guild from API:", err)
+		b.logError("fetching guild failed", "guild_id", guildID, "error", err)
 		return false
 	}
 
@@ -425,7 +481,7 @@ func (b *Bot) isAdminOrOwner(s *discordgo.Session, guildID, userID string) bool 
 	for _, roleID := range member.Roles {
 		role, err := s.State.Role(guildID, roleID)
 		if err != nil {
-			log.Println("Error fetching role from API:", err)
+			b.logError("fetching role failed", "guild_id", guildID, "role_id", roleID, "error", err)
 			continue
 		}
 		if role.Permissions&discordgo.PermissionAdministrator != 0 {
@@ -449,8 +505,6 @@ func ParseDuration(input string) (time.Duration, error) {
 		return 0, fmt.Errorf("error parsing number: %v", err)
 	}
 
-	fmt.Printf("Parsed number: %d, unit: %s\n", num, match[2])
-
 	switch match[2] {
 	case "s":
 		return time.Duration(num) * time.Second, nil
@@ -472,7 +526,7 @@ func (b *Bot) setPurgeTaskLoop(s *discordgo.Session, channelID string, duration 
 		duration = b.maxDuration
 	}
 
-	fmt.Printf("Setting purge task for channel %s with duration %v\n", channelID, duration)
+	b.logInfo("setting purge task", "channel_id", channelID, "duration", duration)
 
 	b.stopTask(channelID)
 	ticker := time.NewTicker(b.purgeInterval)
@@ -506,7 +560,7 @@ func (b *Bot) purgeChannel(channelID string, duration time.Duration) {
 	for {
 		messages, err := b.messageAPI.ChannelMessages(channelID, 100, lastMessageID, "", "")
 		if err != nil {
-			log.Println("Error fetching messages:", err)
+			b.logError("fetching messages failed", "channel_id", channelID, "error", err)
 			return
 		}
 
@@ -515,14 +569,13 @@ func (b *Bot) purgeChannel(channelID string, duration time.Duration) {
 		}
 
 		for _, msg := range messages {
-			// log.Printf("Checking message %s from %s, timestamp: %s", msg.ID, msg.Author.ID, msg.Timestamp)
 
 			if msg.Timestamp.Before(threshold) {
 				err = b.messageAPI.ChannelMessageDelete(channelID, msg.ID)
 				if err != nil {
-					log.Printf("Error deleting message %s: %v", msg.ID, err)
+					b.logError("deleting message failed", "channel_id", channelID, "message_id", msg.ID, "error", err)
 				} else {
-					log.Printf("Deleted message %s", msg.ID)
+					b.logDebug("deleted message", "channel_id", channelID, "message_id", msg.ID)
 				}
 			}
 		}
@@ -534,13 +587,13 @@ func (b *Bot) purgeChannel(channelID string, duration time.Duration) {
 func (b *Bot) updateTaskDB(channelID string, durationSeconds int) {
 	task := Task{ChannelID: channelID, PurgeDurationSeconds: durationSeconds}
 	if err := b.db.Save(&task).Error; err != nil {
-		log.Println("Error updating database:", err)
+		b.logError("updating task in database failed", "channel_id", channelID, "error", err)
 	}
 }
 
 func (b *Bot) deleteTaskDB(channelID string) {
 	if err := b.db.Delete(&Task{}, "channel_id = ?", channelID).Error; err != nil {
-		log.Println("Error deleting from database:", err)
+		b.logError("deleting task from database failed", "channel_id", channelID, "error", err)
 	}
 }
 
@@ -551,7 +604,7 @@ func (b *Bot) setThreadCleanupTaskLoop(s *discordgo.Session, parentChannelID str
 		duration = b.maxDuration
 	}
 
-	fmt.Printf("Setting thread cleanup task for parent channel %s with duration %v\n", parentChannelID, duration)
+	b.logInfo("setting thread cleanup task", "parent_channel_id", parentChannelID, "duration", duration)
 
 	b.stopThreadCleanupTask(parentChannelID)
 	ticker := time.NewTicker(b.purgeInterval)
@@ -579,7 +632,7 @@ func (b *Bot) runThreadCleanup(s *discordgo.Session, parentChannelID string, dur
 	// Get parent channel to find guild ID
 	channel, err := s.Channel(parentChannelID)
 	if err != nil {
-		log.Printf("Error fetching parent channel %s: %v", parentChannelID, err)
+		b.logError("fetching parent channel failed", "parent_channel_id", parentChannelID, "error", err)
 		return
 	}
 
@@ -600,8 +653,7 @@ func (b *Bot) runThreadCleanup(s *discordgo.Session, parentChannelID string, dur
 		if err != nil {
 			// If both methods fail, log that thread list is not implemented
 			// This indicates discordgo may not expose thread listing API
-			log.Printf("Thread list not implemented: discordgo may not expose thread listing API. Error: %v", err)
-			log.Printf("Need to verify correct discordgo method names for listing threads or implement REST API call directly")
+			b.logError("listing threads failed", "parent_channel_id", parentChannelID, "guild_id", channel.GuildID, "error", err)
 			return
 		}
 
@@ -619,49 +671,56 @@ func (b *Bot) runThreadCleanup(s *discordgo.Session, parentChannelID string, dur
 		return
 	}
 
+	var deleted int
+	var deletedAges []time.Duration
 	for _, thread := range threads {
-		// Get thread creation time from Discord snowflake ID (discordgo has no ThreadMetadata.CreatedAt or Channel.CreatedAt)
 		creationTime, err := discordgo.SnowflakeTimestamp(thread.ID)
 		if err != nil {
-			log.Printf("Could not parse thread ID %s: %v", thread.ID, err)
+			b.logWarn("could not parse thread ID", "thread_id", thread.ID, "parent_channel_id", parentChannelID, "error", err)
 			continue
 		}
 
 		if creationTime.Before(threshold) {
+			age := time.Since(creationTime)
 			_, err = s.ChannelDelete(thread.ID)
 			if err != nil {
-				log.Printf("Error deleting thread %s: %v", thread.ID, err)
+				b.logError("deleting thread failed", "thread_id", thread.ID, "parent_channel_id", parentChannelID, "guild_id", channel.GuildID, "error", err)
 			} else {
-				log.Printf("Deleted thread %s", thread.ID)
+				deleted++
+				deletedAges = append(deletedAges, age)
+				b.logDebug("deleted thread", "thread_id", thread.ID, "parent_channel_id", parentChannelID, "age", age)
 			}
 		}
+	}
+	if deleted > 0 {
+		b.logInfo("thread cleanup: deleted threads", "parent_channel_id", parentChannelID, "guild_id", channel.GuildID, "count", deleted, "ages", deletedAges)
 	}
 }
 
 func (b *Bot) updateThreadCleanupTaskDB(parentChannelID string, durationSeconds int) {
 	task := ThreadCleanupTask{ParentChannelID: parentChannelID, PurgeDurationSeconds: durationSeconds}
 	if err := b.db.Save(&task).Error; err != nil {
-		log.Println("Error updating thread cleanup task database:", err)
+		b.logError("updating thread cleanup task in database failed", "parent_channel_id", parentChannelID, "error", err)
 	}
 }
 
 func (b *Bot) deleteThreadCleanupTaskDB(parentChannelID string) {
 	if err := b.db.Delete(&ThreadCleanupTask{}, "parent_channel_id = ?", parentChannelID).Error; err != nil {
-		log.Println("Error deleting thread cleanup task from database:", err)
+		b.logError("deleting thread cleanup task from database failed", "parent_channel_id", parentChannelID, "error", err)
 	}
 }
 
 func (b *Bot) listPurgeTasks(s *discordgo.Session, guildID, channelID string) {
 	var tasks []Task
 	if err := b.db.Find(&tasks).Error; err != nil {
-		log.Println("Error querying tasks:", err)
+		b.logError("querying tasks failed", "guild_id", guildID, "channel_id", channelID, "error", err)
 		s.ChannelMessageSend(channelID, "Error retrieving tasks.")
 		return
 	}
 
 	var threadTasks []ThreadCleanupTask
 	if err := b.db.Find(&threadTasks).Error; err != nil {
-		log.Println("Error querying thread cleanup tasks:", err)
+		b.logError("querying thread cleanup tasks failed", "guild_id", guildID, "channel_id", channelID, "error", err)
 		s.ChannelMessageSend(channelID, "Error retrieving thread cleanup tasks.")
 		return
 	}
@@ -679,7 +738,7 @@ func (b *Bot) listPurgeTasks(s *discordgo.Session, guildID, channelID string) {
 			// Try fetching directly if not in state
 			ch, err = s.Channel(task.ChannelID)
 			if err != nil {
-				log.Println("Error fetching channel:", err)
+				b.logError("fetching channel failed in list", "channel_id", task.ChannelID, "guild_id", guildID, "error", err)
 				continue
 			}
 		}
@@ -698,7 +757,7 @@ func (b *Bot) listPurgeTasks(s *discordgo.Session, guildID, channelID string) {
 			// Try fetching directly if not in state
 			ch, err = s.Channel(task.ParentChannelID)
 			if err != nil {
-				log.Println("Error fetching parent channel:", err)
+				b.logError("fetching parent channel failed in list", "parent_channel_id", task.ParentChannelID, "guild_id", guildID, "error", err)
 				continue
 			}
 		}
