@@ -46,19 +46,52 @@ Welcome to **PurgeBot**! This bot helps manage and clean up your Discord server 
     go run main.go
     ```
 
+    **Command-line options:**
+    
+    - `-env` (or `-env-file`): Path to `.env` file. If omitted or empty, `.env` is loaded from the current working directory.
+      ```bash
+      go run main.go -env /path/to/.env
+      ```
+    
+    - `-db`: Path to database file. Defaults to `database.db`. This overrides the `DB_PATH` environment variable if set.
+      ```bash
+      go run main.go -db /var/data/purge.db
+      ```
+    
+    **Examples:**
+    
+    ```bash
+    # Use custom .env file location
+    go run main.go -env /etc/purgebot/.env
+    
+    # Use custom database path
+    go run main.go -db /var/lib/purgebot/purge.db
+    
+    # Use both custom .env and database paths
+    go run main.go -env /etc/purgebot/.env -db /var/lib/purgebot/purge.db
+    ```
+
 ## 📜 Commands
 
 ### Purge Old Messages
 
-Automatically purge old messages in the channel.
+Automatically purge old messages in the channel. You can use a bare duration or the `messages` subcommand.
 
-- **Usage:** `@PurgeBot <duration>`
-- **Example:** `@PurgeBot 30s` (purges messages older than 30 seconds)
-- **Note:** `@PurgeBot` is just an example. The actual bot mention may vary based on the bot's name or configuration.
+- **Usage:** `@PurgeBot <duration>` or `@PurgeBot messages <duration>`
+- **Example:** `@PurgeBot 3d` or `@PurgeBot messages 3d` (purges messages older than 3 days)
+- **Stop messages only:** `@PurgeBot messages stop`
 
-### Stop Purge Task
+### Delete Old Threads
 
-Stop the active purge task in the channel.
+Delete threads under this channel that are older than the given duration (the thread itself is deleted, not its messages). Uses a separate duration from message purge (e.g. messages 3d, threads 6d).
+
+- **Usage:** `@PurgeBot threads <duration>`
+- **Example:** `@PurgeBot threads 6d` (deletes threads under this channel older than 6 days)
+- **Stop threads only:** `@PurgeBot threads stop`
+
+### Stop All Tasks
+
+Stop both message purge and thread cleanup for this channel.
 
 - **Usage:** `@PurgeBot stop`
 
