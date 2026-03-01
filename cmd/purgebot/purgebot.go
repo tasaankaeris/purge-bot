@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/keshon/purge-bot/internal/bot"
@@ -94,5 +96,14 @@ func main() {
 
 	l.Info("bot running", "purge_interval", "33s", "min_duration", "30s", "max_duration", "3333d")
 	fmt.Println("Bot is now running. Press CTRL+C to exit.")
-	select {}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	l.Info("shutting down gracefully")
+	b.Stop()
+	if err := dg.Close(); err != nil {
+		l.Error("error closing Discord session", "error", err)
+	}
 }

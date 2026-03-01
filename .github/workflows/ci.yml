@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
@@ -40,6 +42,13 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: go mod verify
+        run: go mod download && go mod verify
 
       - name: test
-        run: go test ./... -count=1
+        env:
+          CGO_ENABLED: "1"
+        run: go test -v ./... -count=1

@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -227,7 +228,7 @@ func TestPurgeChannel(t *testing.T) {
 	}
 
 	bot := NewBot(db, mockAPI)
-	bot.purgeChannel("test-channel", 1*time.Hour)
+	bot.purgeChannel(context.Background(), "test-channel", 1*time.Hour)
 
 	// Verify that old messages were deleted
 	if len(mockAPI.deleteCalls) != 2 {
@@ -258,7 +259,7 @@ func TestPurgeChannelWithFetchError(t *testing.T) {
 	}
 
 	bot := NewBot(db, mockAPI)
-	bot.purgeChannel("test-channel", 1*time.Hour)
+	bot.purgeChannel(context.Background(), "test-channel", 1*time.Hour)
 
 	// Should not delete anything if fetch fails
 	if len(mockAPI.deleteCalls) != 0 {
@@ -286,10 +287,98 @@ func TestPurgeChannelWithDeleteError(t *testing.T) {
 	}
 
 	bot := NewBot(db, mockAPI)
-	bot.purgeChannel("test-channel", 1*time.Hour)
+	bot.purgeChannel(context.Background(), "test-channel", 1*time.Hour)
 
 	// Should still attempt to delete (error is logged but doesn't stop processing)
 	if len(mockAPI.deleteCalls) != 1 {
 		t.Errorf("Expected 1 delete call even with error, got %d", len(mockAPI.deleteCalls))
 	}
+}
+
+func TestIsBotMentionPrefix(t *testing.T) {
+	botID := "123456789"
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"direct mention no nick", "<@" + botID + "> help", true},
+		{"direct mention with nick", "<@!" + botID + "> help", true},
+		{"no space after mention", "<@" + botID + ">help", true},
+		{"leading space", "  <@" + botID + "> cmd", true},
+		{"other user mention then bot", "<@999> <@" + botID + "> help", false},
+		{"contains bot id but not prefix", "help <@" + botID + ">", false},
+		{"wrong id", "<@999> help", false},
+		{"empty", "", false},
+		{"only mention", "<@" + botID + ">", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBotMentionPrefix(tt.content, botID); got != tt.want {
+				t.Errorf("isBotMentionPrefix(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStripBotMentionPrefix(t *testing.T) {
+	botID := "123456789"
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"mention then space and cmd", "<@" + botID + "> help", "help"},
+		{"no space", "<@" + botID + ">help", "help"},
+		{"with nick", "<@!" + botID + ">  messages 3d", "messages 3d"},
+		{"leading space", "  <@" + botID + "> list", "list"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripBotMentionPrefix(tt.content, botID)
+			if got != tt.want {
+				t.Errorf("stripBotMentionPrefix(%q) = %q, want %q", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+// mockMessageFetcherDeleterWithFetchCount records how many times ChannelMessages was called.
+type mockMessageFetcherDeleterWithFetchCount struct {
+	mockMessageFetcherDeleter
+	fetchCount int
+}
+
+func (m *mockMessageFetcherDeleterWithFetchCount) ChannelMessages(channelID string, limit int, beforeID, afterID, aroundID string) ([]*discordgo.Message, error) {
+	m.fetchCount++
+	return m.mockMessageFetcherDeleter.ChannelMessages(channelID, limit, beforeID, afterID, aroundID)
+}
+
+func TestPurgeChannelContextCancellation(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Skipf("Skipping: database requires CGO/sqlite: %v", err)
+	}
+	mockAPI := &mockMessageFetcherDeleterWithFetchCount{
+		mockMessageFetcherDeleter: mockMessageFetcherDeleter{
+			messages: []*discordgo.Message{{ID: "1", Timestamp: time.Now().Add(-2 * time.Hour)}},
+		},
+	}
+	bot := NewBot(db, mockAPI)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so purgeChannel exits on first select
+	bot.purgeChannel(ctx, "test-channel", 1*time.Hour)
+	if mockAPI.fetchCount != 0 {
+		t.Errorf("purgeChannel with cancelled context should not call ChannelMessages, got %d calls", mockAPI.fetchCount)
+	}
+}
+
+func TestStopIdempotent(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Skipf("Skipping: database requires CGO/sqlite: %v", err)
+	}
+	bot := NewBot(db, &mockMessageFetcherDeleter{})
+	bot.Stop()
+	bot.Stop() // second call must not panic
 }

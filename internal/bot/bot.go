@@ -1,6 +1,8 @@
 package bot
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -28,17 +30,23 @@ type MessageFetcherDeleter interface {
 
 // Bot represents the purge bot instance.
 type Bot struct {
-	activeTasks       map[string]*time.Ticker
-	activeThreadTasks map[string]*time.Ticker
-	db                *gorm.DB
-	purgeInterval     time.Duration
-	maxDuration       time.Duration
-	minDuration       time.Duration
-	messageAPI        MessageFetcherDeleter
-	session           *discordgo.Session // Kept for non-purge operations (permissions, etc.)
-	log               Logger
-	permErrorLastLog  map[string]time.Time // channelID -> last time we logged permission error
-	permErrorMu       sync.Mutex
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	cancelOnce              sync.Once
+	taskMu                  sync.Mutex
+	activeTasks             map[string]*time.Ticker
+	activeTaskCancels       map[string]context.CancelFunc
+	activeThreadTasks       map[string]*time.Ticker
+	activeThreadTaskCancels map[string]context.CancelFunc
+	db                      *gorm.DB
+	purgeInterval           time.Duration
+	maxDuration             time.Duration
+	minDuration             time.Duration
+	messageAPI              MessageFetcherDeleter
+	session                 *discordgo.Session // Kept for non-purge operations (permissions, etc.)
+	log                     Logger
+	permErrorLastLog        map[string]time.Time // channelID -> last time we logged permission error
+	permErrorMu             sync.Mutex
 }
 
 // Task represents a purge task stored in the database.
@@ -71,15 +79,20 @@ type RolePermission struct {
 
 // NewBot creates a new Bot instance with the provided database and message API interface.
 func NewBot(db *gorm.DB, messageAPI MessageFetcherDeleter) *Bot {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Bot{
-		activeTasks:       make(map[string]*time.Ticker),
-		activeThreadTasks: make(map[string]*time.Ticker),
-		db:                db,
-		purgeInterval:     33 * time.Second,
-		maxDuration:       3333 * 24 * time.Hour,
-		minDuration:       30 * time.Second,
-		messageAPI:        messageAPI,
-		permErrorLastLog:  make(map[string]time.Time),
+		ctx:                     ctx,
+		cancel:                  cancel,
+		activeTasks:             make(map[string]*time.Ticker),
+		activeTaskCancels:       make(map[string]context.CancelFunc),
+		activeThreadTasks:       make(map[string]*time.Ticker),
+		activeThreadTaskCancels: make(map[string]context.CancelFunc),
+		db:                      db,
+		purgeInterval:           33 * time.Second,
+		maxDuration:             3333 * 24 * time.Hour,
+		minDuration:             30 * time.Second,
+		messageAPI:              messageAPI,
+		permErrorLastLog:        make(map[string]time.Time),
 	}
 }
 
@@ -91,6 +104,30 @@ func (b *Bot) SetSession(s *discordgo.Session) {
 // SetLogger sets the logger. If nil, logging is a no-op.
 func (b *Bot) SetLogger(l Logger) {
 	b.log = l
+}
+
+// Stop stops all purge and thread cleanup tickers and releases resources.
+// It is safe to call multiple times. Use for graceful shutdown.
+func (b *Bot) Stop() {
+	b.cancelOnce.Do(b.cancel)
+	b.taskMu.Lock()
+	defer b.taskMu.Unlock()
+	for _, cancel := range b.activeTaskCancels {
+		cancel()
+	}
+	b.activeTaskCancels = make(map[string]context.CancelFunc)
+	for _, cancel := range b.activeThreadTaskCancels {
+		cancel()
+	}
+	b.activeThreadTaskCancels = make(map[string]context.CancelFunc)
+	for channelID, ticker := range b.activeTasks {
+		ticker.Stop()
+		delete(b.activeTasks, channelID)
+	}
+	for parentChannelID, ticker := range b.activeThreadTasks {
+		ticker.Stop()
+		delete(b.activeThreadTasks, parentChannelID)
+	}
 }
 
 func (b *Bot) logDebug(msg string, keyvals ...interface{}) {
@@ -110,8 +147,15 @@ func (b *Bot) logWarn(msg string, keyvals ...interface{}) {
 }
 
 // sendChannelMessage sends a message to a channel and logs a warning on failure.
+// Uses AllowedMentions with empty Parse to prevent @everyone/@here abuse from user-supplied text.
 func (b *Bot) sendChannelMessage(s *discordgo.Session, channelID, content string) {
-	if _, err := s.ChannelMessageSend(channelID, content); err != nil {
+	msg := &discordgo.MessageSend{
+		Content: content,
+		AllowedMentions: &discordgo.MessageAllowedMentions{
+			Parse: []discordgo.AllowedMentionType{},
+		},
+	}
+	if _, err := s.ChannelMessageSendComplex(channelID, msg); err != nil {
 		b.logWarn("failed to send message", "channel_id", channelID, "error", err)
 	}
 }
@@ -204,27 +248,58 @@ func (b *Bot) Ready(s *discordgo.Session, event *discordgo.Ready) {
 	b.logInfo("ready: restored tasks", "message_purge_tasks", len(tasks), "thread_cleanup_tasks", len(threadTasks))
 }
 
+// isBotMentionPrefix returns true if content (after trimming leading/trailing space)
+// starts with the bot's mention. Discord format is <@USER_ID> or <@!USER_ID>.
+func isBotMentionPrefix(content, botID string) bool {
+	trimmed := strings.TrimSpace(content)
+	return strings.HasPrefix(trimmed, "<@"+botID+">") || strings.HasPrefix(trimmed, "<@!"+botID+">")
+}
+
+// stripBotMentionPrefix removes the bot mention prefix from content and returns the rest.
+// Discord format is <@USER_ID> or <@!USER_ID>.
+func stripBotMentionPrefix(content, botID string) string {
+	trimmed := strings.TrimSpace(content)
+	for _, prefix := range []string{"<@!" + botID + ">", "<@" + botID + ">"} {
+		if strings.HasPrefix(trimmed, prefix) {
+			return strings.TrimSpace(trimmed[len(prefix):])
+		}
+	}
+	return trimmed
+}
+
 // MessageCreate handles incoming Discord messages.
 func (b *Bot) MessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	b.logDebug("received message", "author_id", m.Author.ID, "channel_id", m.ChannelID, "guild_id", m.GuildID, "content", m.Content)
+	b.logDebug("received message", "author_id", m.Author.ID, "channel_id", m.ChannelID, "guild_id", m.GuildID, "message_id", m.ID)
 
-	if strings.HasPrefix(m.Content, "<@") && strings.Contains(m.Content, s.State.User.ID) {
+	if isBotMentionPrefix(m.Content, s.State.User.ID) {
 		b.logDebug("bot mentioned", "channel_id", m.ChannelID, "guild_id", m.GuildID)
 
 		if !b.isAdminOrOwner(s, m.GuildID, m.Author.ID) && !b.checkUserPermission(s, m.GuildID, m.Author.ID) {
 			b.logPermissionErrorOnce(m.ChannelID, m.GuildID, m.Author.ID)
-			b.sendChannelMessage(s, m.ChannelID, "You don't have the necessary permissions to use this bot. You must be either the server owner, an administrator, or a user with special permissions assigned by an admin.")
+			b.sendChannelMessage(s, m.ChannelID, "You don't have the necessary permissions to use this bot. You must be either the server owner, an administrator, or a user with special permissions assigned by an admin. If you are the server owner or an administrator, ensure the bot has the Server Members intent and required permissions in the Discord Developer Portal and server settings.")
 			return
 		}
 
-		args := strings.Fields(m.Content)
-		if len(args) < 2 {
-			b.sendChannelMessage(s, m.ChannelID, "Insufficient arguments. Type @bot help for available commands.")
+		rest := stripBotMentionPrefix(m.Content, s.State.User.ID)
+		args := strings.Fields(rest)
+		if len(args) < 1 {
+			b.sendChannelMessage(s, m.ChannelID, "No command. Type @bot help for available commands.")
 			return
 		}
 
-		command := strings.ToLower(args[1])
+		command := strings.ToLower(args[0])
 		channelID := m.ChannelID
+
+		// Permission management commands require admin/owner; CanPurge users cannot run these.
+		permMgmtCommands := map[string]bool{
+			"adduser": true, "removeuser": true, "addrole": true, "removerole": true,
+			"adduserid": true, "removeuserid": true, "addroleid": true, "removeroleid": true,
+			"listpermissions": true,
+		}
+		if permMgmtCommands[command] && !b.isAdminOrOwner(s, m.GuildID, m.Author.ID) {
+			b.sendChannelMessage(s, m.ChannelID, "Only server owners and administrators can manage permissions.")
+			return
+		}
 
 		botMention := fmt.Sprintf("<@%s>", s.State.User.ID)
 
@@ -260,6 +335,7 @@ user permission to manage purge tasks:
 %s adduserid <user id>
 %s removeuser <username>
 %s removeuserid <user id>
+Username matches the first user found in the member list; for accuracy prefer adduserid/removeuserid with a user ID.
 
 role permission to manage purge tasks:
 %s addrole <role name>
@@ -280,40 +356,40 @@ get help:
 			b.sendChannelMessage(s, m.ChannelID, helpMessage)
 
 		case "messages":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a duration (e.g., '3d') or 'stop'. Usage: @bot messages 3d or @bot messages stop")
 				return
 			}
-			if args[2] == "stop" {
+			if args[1] == "stop" {
 				b.stopAndDeleteTask(channelID)
 				b.sendChannelMessage(s, m.ChannelID, "Message purging stopped for this channel.")
 			} else {
-				duration, err := ParseDuration(args[2])
+				duration, err := ParseDuration(args[1])
 				if err != nil {
 					b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Invalid duration: %v. Type @bot help for available commands.", err))
 					return
 				}
-				b.setPurgeTaskLoop(s, channelID, duration)
-				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Messages older than %s will be deleted on a rolling basis in this channel.", FormatDuration(duration)))
+				effective := b.setPurgeTaskLoop(s, channelID, duration)
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Messages older than %s will be deleted on a rolling basis in this channel.", FormatDuration(effective)))
 			}
 
 		case "threads":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a duration (e.g., '6d') or 'stop'. Usage: @bot threads 6d or @bot threads stop")
 				return
 			}
-			if args[2] == "stop" {
+			if args[1] == "stop" {
 				b.stopThreadCleanupTask(channelID)
 				b.deleteThreadCleanupTaskDB(channelID)
 				b.sendChannelMessage(s, m.ChannelID, "Thread cleanup stopped for this channel.")
 			} else {
-				duration, err := ParseDuration(args[2])
+				duration, err := ParseDuration(args[1])
 				if err != nil {
 					b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Invalid duration: %v. Type @bot help for available commands.", err))
 					return
 				}
-				b.setThreadCleanupTaskLoop(s, channelID, duration)
-				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Threads older than %s will be deleted on a rolling basis under this channel.", FormatDuration(duration)))
+				effective := b.setThreadCleanupTaskLoop(s, channelID, duration)
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Threads older than %s will be deleted on a rolling basis under this channel.", FormatDuration(effective)))
 			}
 
 		case "stop":
@@ -326,24 +402,27 @@ get help:
 			b.listPurgeTasks(s, m.GuildID, m.ChannelID)
 
 		case "adduser":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a username.")
 				return
 			}
-			username := strings.Join(args[2:], " ")
+			username := strings.Join(args[1:], " ")
 			userID, err := b.getUserIDByName(s, m.GuildID, username)
 			if err != nil {
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User '%s' not found.", username))
 				return
 			}
-			b.addUserPermission(m.GuildID, userID, true)
-			b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User '%s' can now manage purge tasks.", username))
+			if err := b.addUserPermission(m.GuildID, userID, true); err != nil {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Failed to add permission: %v", err))
+			} else {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User '%s' can now manage purge tasks.", username))
+			}
 		case "removeuser":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a username.")
 				return
 			}
-			username := strings.Join(args[2:], " ")
+			username := strings.Join(args[1:], " ")
 			userID, err := b.getUserIDByName(s, m.GuildID, username)
 			if err != nil {
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User '%s' not found.", username))
@@ -355,24 +434,27 @@ get help:
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User '%s' can no longer manage purge tasks.", username))
 			}
 		case "addrole":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a role name.")
 				return
 			}
-			roleName := strings.Join(args[2:], " ")
+			roleName := strings.Join(args[1:], " ")
 			roleID, err := b.getRoleIDByName(s, m.GuildID, roleName)
 			if err != nil {
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Role '%s' not found.", roleName))
 				return
 			}
-			b.addRolePermission(m.GuildID, roleID, true)
-			b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Role '%s' can now manage purge tasks.", roleName))
+			if err := b.addRolePermission(m.GuildID, roleID, true); err != nil {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Failed to add permission: %v", err))
+			} else {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Role '%s' can now manage purge tasks.", roleName))
+			}
 		case "removerole":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a role name.")
 				return
 			}
-			roleName := strings.Join(args[2:], " ")
+			roleName := strings.Join(args[1:], " ")
 			roleID, err := b.getRoleIDByName(s, m.GuildID, roleName)
 			if err != nil {
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Role '%s' not found.", roleName))
@@ -384,40 +466,46 @@ get help:
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Role '%s' can no longer manage purge tasks.", roleName))
 			}
 		case "adduserid":
-			if len(args) < 3 {
-				b.sendChannelMessage(s, m.ChannelID, "Please provide a username.")
-				return
-			}
-			userID := args[2]
-			b.addUserPermission(m.GuildID, userID, true)
-			b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User %s can now manage purge tasks.", userID))
-			return
-		case "removeuserid":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a user ID.")
 				return
 			}
-			userID := args[2]
+			userID := args[1]
+			if err := b.addUserPermission(m.GuildID, userID, true); err != nil {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Failed to add permission: %v", err))
+			} else {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User %s can now manage purge tasks.", userID))
+			}
+			return
+		case "removeuserid":
+			if len(args) < 2 {
+				b.sendChannelMessage(s, m.ChannelID, "Please provide a user ID.")
+				return
+			}
+			userID := args[1]
 			if err := b.removeUserPermission(m.GuildID, userID); err != nil {
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Failed to remove user %s's permissions: %v", userID, err))
 			} else {
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("User %s can no longer manage purge tasks.", userID))
 			}
 		case "addroleid":
-			if len(args) < 3 {
-				b.sendChannelMessage(s, m.ChannelID, "Please provide a role name.")
-				return
-			}
-			roleID := args[2]
-			b.addRolePermission(m.GuildID, roleID, true)
-			b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Role %s can now manage purge tasks.", roleID))
-			return
-		case "removeroleid":
-			if len(args) < 3 {
+			if len(args) < 2 {
 				b.sendChannelMessage(s, m.ChannelID, "Please provide a role ID.")
 				return
 			}
-			roleID := args[2]
+			roleID := args[1]
+			if err := b.addRolePermission(m.GuildID, roleID, true); err != nil {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Failed to add permission: %v", err))
+			} else {
+				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Role %s can now manage purge tasks.", roleID))
+			}
+			return
+		case "removeroleid":
+			if len(args) < 2 {
+				b.sendChannelMessage(s, m.ChannelID, "Please provide a role ID.")
+				return
+			}
+			roleID := args[1]
 			if err := b.removeRolePermission(m.GuildID, roleID); err != nil {
 				b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Failed to remove role %s's permissions: %v", roleID, err))
 			} else {
@@ -464,8 +552,8 @@ get help:
 				b.sendChannelMessage(s, m.ChannelID, "Invalid duration. Type @bot help for available commands.")
 				return
 			}
-			b.setPurgeTaskLoop(s, channelID, duration)
-			b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Messages older than %s will be deleted on a rolling basis in this channel.", FormatDuration(duration)))
+			effective := b.setPurgeTaskLoop(s, channelID, duration)
+			b.sendChannelMessage(s, m.ChannelID, fmt.Sprintf("Messages older than %s will be deleted on a rolling basis in this channel.", FormatDuration(effective)))
 		}
 	}
 }
@@ -490,12 +578,29 @@ func (b *Bot) isAdminOrOwner(s *discordgo.Session, guildID, userID string) bool 
 		return true
 	}
 
+	// Local cache of guild roles for fallback when State is not populated
+	var rolesByID map[string]*discordgo.Role
+
 	// Check if the user has the Administrator permission
 	for _, roleID := range member.Roles {
 		role, err := s.State.Role(guildID, roleID)
 		if err != nil {
-			b.logError("fetching role failed", "guild_id", guildID, "role_id", roleID, "error", err)
-			continue
+			// Fallback: fetch all roles once when State.Role fails (e.g. State not populated)
+			if rolesByID == nil {
+				guildRoles, fetchErr := s.GuildRoles(guildID)
+				if fetchErr != nil {
+					b.logError("fetching guild roles failed", "guild_id", guildID, "error", fetchErr)
+					return false
+				}
+				rolesByID = make(map[string]*discordgo.Role, len(guildRoles))
+				for _, r := range guildRoles {
+					rolesByID[r.ID] = r
+				}
+			}
+			role = rolesByID[roleID]
+			if role == nil {
+				continue
+			}
 		}
 		if role.Permissions&discordgo.PermissionAdministrator != 0 {
 			return true
@@ -532,7 +637,7 @@ func ParseDuration(input string) (time.Duration, error) {
 	}
 }
 
-func (b *Bot) setPurgeTaskLoop(_ *discordgo.Session, channelID string, duration time.Duration) {
+func (b *Bot) setPurgeTaskLoop(_ *discordgo.Session, channelID string, duration time.Duration) time.Duration {
 	if duration < b.minDuration {
 		duration = b.minDuration
 	} else if duration > b.maxDuration {
@@ -541,24 +646,51 @@ func (b *Bot) setPurgeTaskLoop(_ *discordgo.Session, channelID string, duration 
 
 	b.logInfo("setting purge task", "channel_id", channelID, "duration", duration)
 
-	b.stopTask(channelID)
+	b.taskMu.Lock()
+	b.stopTaskUnlocked(channelID)
 	ticker := time.NewTicker(b.purgeInterval)
+	taskCtx, taskCancel := context.WithCancel(b.ctx)
 	b.activeTasks[channelID] = ticker
+	b.activeTaskCancels[channelID] = taskCancel
+
+	if err := b.updateTaskDB(channelID, int(duration.Seconds())); err != nil {
+		b.stopTaskUnlocked(channelID)
+		b.taskMu.Unlock()
+		b.logError("updating task in database failed", "channel_id", channelID, "error", err)
+		return duration
+	}
+	b.taskMu.Unlock()
 
 	go func() {
-		for range ticker.C {
-			b.purgeChannel(channelID, duration)
+		for {
+			select {
+			case <-taskCtx.Done():
+				return
+			case <-ticker.C:
+				b.purgeChannel(taskCtx, channelID, duration)
+			}
 		}
 	}()
 
-	b.updateTaskDB(channelID, int(duration.Seconds()))
+	return duration
 }
 
-func (b *Bot) stopTask(channelID string) {
+// stopTaskUnlocked stops the purge task for channelID. Caller must hold taskMu.
+func (b *Bot) stopTaskUnlocked(channelID string) {
+	if cancel, ok := b.activeTaskCancels[channelID]; ok {
+		cancel()
+		delete(b.activeTaskCancels, channelID)
+	}
 	if ticker, ok := b.activeTasks[channelID]; ok {
 		ticker.Stop()
 		delete(b.activeTasks, channelID)
 	}
+}
+
+func (b *Bot) stopTask(channelID string) {
+	b.taskMu.Lock()
+	b.stopTaskUnlocked(channelID)
+	b.taskMu.Unlock()
 }
 
 func (b *Bot) stopAndDeleteTask(channelID string) {
@@ -566,11 +698,16 @@ func (b *Bot) stopAndDeleteTask(channelID string) {
 	b.deleteTaskDB(channelID)
 }
 
-func (b *Bot) purgeChannel(channelID string, duration time.Duration) {
+func (b *Bot) purgeChannel(ctx context.Context, channelID string, duration time.Duration) {
 	var lastMessageID string
 	threshold := time.Now().Add(-duration)
 
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		messages, err := b.messageAPI.ChannelMessages(channelID, 100, lastMessageID, "", "")
 		if err != nil {
 			b.logError("fetching messages failed", "channel_id", channelID, "error", err)
@@ -597,11 +734,9 @@ func (b *Bot) purgeChannel(channelID string, duration time.Duration) {
 	}
 }
 
-func (b *Bot) updateTaskDB(channelID string, durationSeconds int) {
+func (b *Bot) updateTaskDB(channelID string, durationSeconds int) error {
 	task := Task{ChannelID: channelID, PurgeDurationSeconds: durationSeconds}
-	if err := b.db.Save(&task).Error; err != nil {
-		b.logError("updating task in database failed", "channel_id", channelID, "error", err)
-	}
+	return b.db.Save(&task).Error
 }
 
 func (b *Bot) deleteTaskDB(channelID string) {
@@ -610,7 +745,7 @@ func (b *Bot) deleteTaskDB(channelID string) {
 	}
 }
 
-func (b *Bot) setThreadCleanupTaskLoop(s *discordgo.Session, parentChannelID string, duration time.Duration) {
+func (b *Bot) setThreadCleanupTaskLoop(s *discordgo.Session, parentChannelID string, duration time.Duration) time.Duration {
 	if duration < b.minDuration {
 		duration = b.minDuration
 	} else if duration > b.maxDuration {
@@ -619,27 +754,59 @@ func (b *Bot) setThreadCleanupTaskLoop(s *discordgo.Session, parentChannelID str
 
 	b.logInfo("setting thread cleanup task", "parent_channel_id", parentChannelID, "duration", duration)
 
-	b.stopThreadCleanupTask(parentChannelID)
+	b.taskMu.Lock()
+	b.stopThreadCleanupTaskUnlocked(parentChannelID)
 	ticker := time.NewTicker(b.purgeInterval)
+	taskCtx, taskCancel := context.WithCancel(b.ctx)
 	b.activeThreadTasks[parentChannelID] = ticker
+	b.activeThreadTaskCancels[parentChannelID] = taskCancel
+
+	if err := b.updateThreadCleanupTaskDB(parentChannelID, int(duration.Seconds())); err != nil {
+		b.stopThreadCleanupTaskUnlocked(parentChannelID)
+		b.taskMu.Unlock()
+		b.logError("updating thread cleanup task in database failed", "parent_channel_id", parentChannelID, "error", err)
+		return duration
+	}
+	b.taskMu.Unlock()
 
 	go func() {
-		for range ticker.C {
-			b.runThreadCleanup(s, parentChannelID, duration)
+		for {
+			select {
+			case <-taskCtx.Done():
+				return
+			case <-ticker.C:
+				b.runThreadCleanup(taskCtx, s, parentChannelID, duration)
+			}
 		}
 	}()
 
-	b.updateThreadCleanupTaskDB(parentChannelID, int(duration.Seconds()))
+	return duration
 }
 
-func (b *Bot) stopThreadCleanupTask(parentChannelID string) {
+// stopThreadCleanupTaskUnlocked stops the thread cleanup task for parentChannelID. Caller must hold taskMu.
+func (b *Bot) stopThreadCleanupTaskUnlocked(parentChannelID string) {
+	if cancel, ok := b.activeThreadTaskCancels[parentChannelID]; ok {
+		cancel()
+		delete(b.activeThreadTaskCancels, parentChannelID)
+	}
 	if ticker, ok := b.activeThreadTasks[parentChannelID]; ok {
 		ticker.Stop()
 		delete(b.activeThreadTasks, parentChannelID)
 	}
 }
 
-func (b *Bot) runThreadCleanup(s *discordgo.Session, parentChannelID string, duration time.Duration) {
+func (b *Bot) stopThreadCleanupTask(parentChannelID string) {
+	b.taskMu.Lock()
+	b.stopThreadCleanupTaskUnlocked(parentChannelID)
+	b.taskMu.Unlock()
+}
+
+func (b *Bot) runThreadCleanup(ctx context.Context, s *discordgo.Session, parentChannelID string, duration time.Duration) {
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
 	threshold := time.Now().Add(-duration)
 
 	// Get parent channel to find guild ID
@@ -649,44 +816,101 @@ func (b *Bot) runThreadCleanup(s *discordgo.Session, parentChannelID string, dur
 		return
 	}
 
-	// Try to list active threads for the channel
-	// Note: Check discordgo API documentation for correct method names.
-	// Discord API endpoints are:
-	// - GET /channels/{channel.id}/threads/active
-	// - GET /guilds/{guild.id}/threads/active
-	// If discordgo doesn't expose these methods, the code below will need to be updated
-	// with the correct method names or REST API calls.
-	var threads []*discordgo.Channel
+	// Collect active and archived threads, merged and deduplicated by thread ID
+	threadsByID := make(map[string]*discordgo.Channel)
 
-	// List active threads for the channel (discordgo v0.28.1: ThreadsActive / GuildThreadsActive)
+	// List active threads for the channel (discordgo: ThreadsActive / GuildThreadsActive)
 	threadsList, err := s.ThreadsActive(parentChannelID)
 	if err != nil {
 		// Fallback: try to get threads from guild
 		guildThreads, err := s.GuildThreadsActive(channel.GuildID)
 		if err != nil {
-			// If both methods fail, log that thread list is not implemented
-			// This indicates discordgo may not expose thread listing API
-			b.logError("listing threads failed", "parent_channel_id", parentChannelID, "guild_id", channel.GuildID, "error", err)
+			b.logError("listing active threads failed", "parent_channel_id", parentChannelID, "guild_id", channel.GuildID, "error", err)
 			return
 		}
-
-		// Filter threads that belong to this parent channel
 		for _, thread := range guildThreads.Threads {
 			if thread.ParentID == parentChannelID {
-				threads = append(threads, thread)
+				threadsByID[thread.ID] = thread
 			}
 		}
 	} else {
-		threads = threadsList.Threads
+		for _, thread := range threadsList.Threads {
+			threadsByID[thread.ID] = thread
+		}
+	}
+
+	// List archived public threads for the channel (discordgo: ThreadsArchived)
+	var before *time.Time
+	for {
+		archivedList, err := s.ThreadsArchived(parentChannelID, before, 100)
+		if err != nil {
+			b.logDebug("listing archived threads failed (archived threads may not be supported for this channel)", "parent_channel_id", parentChannelID, "error", err)
+			break
+		}
+		if archivedList == nil || len(archivedList.Threads) == 0 {
+			break
+		}
+		for _, thread := range archivedList.Threads {
+			threadsByID[thread.ID] = thread
+		}
+		// Use last thread's archive timestamp for pagination (next page = threads archived before this)
+		if last := archivedList.Threads[len(archivedList.Threads)-1]; last.ThreadMetadata != nil {
+			before = &last.ThreadMetadata.ArchiveTimestamp
+		} else {
+			break
+		}
+		if len(archivedList.Threads) < 100 {
+			break
+		}
+	}
+
+	// List archived private threads for the channel (discordgo: ThreadsPrivateArchived)
+	before = nil
+	for {
+		archivedList, err := s.ThreadsPrivateArchived(parentChannelID, before, 100)
+		if err != nil {
+			b.logDebug("listing private archived threads failed", "parent_channel_id", parentChannelID, "error", err)
+			break
+		}
+		if archivedList == nil || len(archivedList.Threads) == 0 {
+			break
+		}
+		for _, thread := range archivedList.Threads {
+			threadsByID[thread.ID] = thread
+		}
+		if last := archivedList.Threads[len(archivedList.Threads)-1]; last.ThreadMetadata != nil {
+			before = &last.ThreadMetadata.ArchiveTimestamp
+		} else {
+			break
+		}
+		if len(archivedList.Threads) < 100 {
+			break
+		}
+	}
+
+	threads := make([]*discordgo.Channel, 0, len(threadsByID))
+	for _, thread := range threadsByID {
+		threads = append(threads, thread)
 	}
 
 	if len(threads) == 0 {
 		return
 	}
 
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+	// Thread age is based on creation time (snowflake id). Archived threads are included.
 	var deleted int
 	var deletedAges []time.Duration
 	for _, thread := range threads {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		creationTime, err := discordgo.SnowflakeTimestamp(thread.ID)
 		if err != nil {
 			b.logWarn("could not parse thread ID", "thread_id", thread.ID, "parent_channel_id", parentChannelID, "error", err)
@@ -710,11 +934,9 @@ func (b *Bot) runThreadCleanup(s *discordgo.Session, parentChannelID string, dur
 	}
 }
 
-func (b *Bot) updateThreadCleanupTaskDB(parentChannelID string, durationSeconds int) {
+func (b *Bot) updateThreadCleanupTaskDB(parentChannelID string, durationSeconds int) error {
 	task := ThreadCleanupTask{ParentChannelID: parentChannelID, PurgeDurationSeconds: durationSeconds}
-	if err := b.db.Save(&task).Error; err != nil {
-		b.logError("updating thread cleanup task in database failed", "parent_channel_id", parentChannelID, "error", err)
-	}
+	return b.db.Save(&task).Error
 }
 
 func (b *Bot) deleteThreadCleanupTaskDB(parentChannelID string) {
@@ -745,6 +967,7 @@ func (b *Bot) listPurgeTasks(s *discordgo.Session, guildID, channelID string) {
 	})
 
 	// Process message purge tasks
+	// Tasks from deleted or inaccessible channels are skipped; API errors are logged and the task is omitted from the list.
 	for _, task := range tasks {
 		ch, err := s.State.Channel(task.ChannelID)
 		if err != nil {
@@ -804,27 +1027,39 @@ func (b *Bot) listPurgeTasks(s *discordgo.Session, guildID, channelID string) {
 	b.sendChannelMessage(s, channelID, sb.String())
 }
 
+// Usernames are not unique; returns the first match. Prefer user ID or mention when possible.
+// getUserIDByName looks up a user ID by username. Paginates through all guild members for large guilds.
 func (b *Bot) getUserIDByName(s *discordgo.Session, guildID, username string) (string, error) {
-	members, err := s.GuildMembers(guildID, "", 1000) // Increase limit if necessary
-	if err != nil {
-		return "", err
-	}
-	for _, member := range members {
-		if member.User.Username == username {
-			return member.User.ID, nil
+	const limit = 1000
+	after := ""
+	for {
+		members, err := s.GuildMembers(guildID, after, limit)
+		if err != nil {
+			return "", err
 		}
+		for _, member := range members {
+			if member.User.Username == username {
+				return member.User.ID, nil
+			}
+		}
+		if len(members) < limit {
+			break
+		}
+		after = members[len(members)-1].User.ID
 	}
-
 	return "", fmt.Errorf("user not found, try user ID instead")
 }
 
-func (b *Bot) addUserPermission(guildID, userID string, canPurge bool) {
+func (b *Bot) addUserPermission(guildID, userID string, canPurge bool) error {
 	permission := UserPermission{
 		UserID:   userID,
 		GuildID:  guildID,
 		CanPurge: canPurge,
 	}
-	b.db.Save(&permission)
+	if err := b.db.Save(&permission).Error; err != nil {
+		return fmt.Errorf("failed to add user permission: %w", err)
+	}
+	return nil
 }
 
 func (b *Bot) removeUserPermission(guildID, userID string) error {
@@ -851,13 +1086,16 @@ func (b *Bot) getRoleIDByName(s *discordgo.Session, guildID, roleName string) (s
 	return "", fmt.Errorf("role not found")
 }
 
-func (b *Bot) addRolePermission(guildID, roleID string, canPurge bool) {
+func (b *Bot) addRolePermission(guildID, roleID string, canPurge bool) error {
 	permission := RolePermission{
 		RoleID:   roleID,
 		GuildID:  guildID,
 		CanPurge: canPurge,
 	}
-	b.db.Save(&permission)
+	if err := b.db.Save(&permission).Error; err != nil {
+		return fmt.Errorf("failed to add role permission: %w", err)
+	}
+	return nil
 }
 
 func (b *Bot) removeRolePermission(guildID, roleID string) error {
@@ -872,6 +1110,8 @@ func (b *Bot) checkUserPermission(s *discordgo.Session, guildID, userIDOrName st
 	var permission UserPermission
 	if queryErr := b.db.Where("guild_id = ? AND user_id = ?", guildID, userIDOrName).First(&permission).Error; queryErr == nil {
 		return permission.CanPurge
+	} else if !errors.Is(queryErr, gorm.ErrRecordNotFound) {
+		b.logWarn("permission check: user query failed", "guild_id", guildID, "user_id_or_name", userIDOrName, "error", queryErr)
 	}
 
 	// If no user-specific permission is found, resolve the name to an ID if necessary
@@ -886,6 +1126,8 @@ func (b *Bot) checkUserPermission(s *discordgo.Session, guildID, userIDOrName st
 		// Check user-specific permissions with the resolved user ID
 		if queryErr := b.db.Where("guild_id = ? AND user_id = ?", guildID, userID).First(&permission).Error; queryErr == nil {
 			return permission.CanPurge
+		} else if queryErr != nil && !errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			b.logWarn("permission check: user query failed", "guild_id", guildID, "user_id", userID, "error", queryErr)
 		}
 
 		// Now that we have a valid user ID, get the GuildMember object
@@ -902,6 +1144,8 @@ func (b *Bot) checkUserPermission(s *discordgo.Session, guildID, userIDOrName st
 			if rolePermission.CanPurge {
 				return true
 			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			b.logWarn("permission check: role query failed", "guild_id", guildID, "role_id", roleID, "error", err)
 		}
 	}
 
