@@ -85,6 +85,25 @@ Welcome to **PurgeBot**! This bot helps manage and clean up your Discord server 
     go run main.go -env /etc/purgebot/.env -db /var/lib/purgebot/purge.db
     ```
 
+## 🧪 Testing
+
+Run tests the same way as CI (so you catch the same failures locally):
+
+- **Unix / macOS / Git Bash:**  
+  `./test.sh`  
+  (Make it executable once: `chmod +x test.sh`)
+
+- **Windows (cmd):**  
+  `test.bat`
+
+- **Or run the CI command directly:**  
+  `CGO_ENABLED=1 go test -v ./... -count=1`
+
+**Requirements for full tests:** A C compiler (e.g. `gcc`) is required so the SQLite driver can build and the database-backed tests run. If you don't have one, use `CGO_ENABLED=0 go test ./... -count=1`; the same tests that run in CI will be skipped locally.
+
+**Lint (optional):**  
+`golangci-lint run ./...`
+
 ## 📜 Commands
 
 ### Purge Old Messages

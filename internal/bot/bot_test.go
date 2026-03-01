@@ -20,16 +20,25 @@ type mockMessageFetcherDeleter struct {
 	shouldLoop   bool
 	loopCount    int
 	maxLoopCount int
+	// returnEmptyAfterFirstCall makes ChannelMessages return empty after the first successful
+	// return of messages, so purgeChannel's loop can exit instead of running forever.
+	returnEmptyAfterFirstCall bool
+	fetchCount                int
 }
 
 func (m *mockMessageFetcherDeleter) ChannelMessages(channelID string, limit int, beforeID, afterID, aroundID string) ([]*discordgo.Message, error) {
 	if m.fetchError != nil {
 		return nil, m.fetchError
 	}
+	if m.returnEmptyAfterFirstCall && m.fetchCount > 0 {
+		return nil, nil
+	}
 	if m.shouldLoop && m.loopCount < m.maxLoopCount {
 		m.loopCount++
+		m.fetchCount++
 		return m.messages, nil
 	}
+	m.fetchCount++
 	return m.messages, nil
 }
 
@@ -223,8 +232,7 @@ func TestPurgeChannel(t *testing.T) {
 				Timestamp: newTime, // This should not be deleted
 			},
 		},
-		shouldLoop:   false,
-		maxLoopCount: 1,
+		returnEmptyAfterFirstCall: true, // so purgeChannel loop exits after first fetch
 	}
 
 	bot := NewBot(db, mockAPI)
@@ -282,8 +290,8 @@ func TestPurgeChannelWithDeleteError(t *testing.T) {
 				Timestamp: oldTime,
 			},
 		},
-		deleteError: errors.New("delete error"),
-		shouldLoop:  false,
+		deleteError:               errors.New("delete error"),
+		returnEmptyAfterFirstCall: true, // so purgeChannel loop exits after first fetch
 	}
 
 	bot := NewBot(db, mockAPI)
