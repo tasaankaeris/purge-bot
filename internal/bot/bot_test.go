@@ -12,13 +12,13 @@ import (
 
 // mockMessageFetcherDeleter is a mock implementation of MessageFetcherDeleter for testing.
 type mockMessageFetcherDeleter struct {
-	messages      []*discordgo.Message
-	deleteCalls   []string
-	fetchError    error
-	deleteError   error
-	shouldLoop    bool
-	loopCount     int
-	maxLoopCount  int
+	messages     []*discordgo.Message
+	deleteCalls  []string
+	fetchError   error
+	deleteError  error
+	shouldLoop   bool
+	loopCount    int
+	maxLoopCount int
 }
 
 func (m *mockMessageFetcherDeleter) ChannelMessages(channelID string, limit int, beforeID, afterID, aroundID string) ([]*discordgo.Message, error) {

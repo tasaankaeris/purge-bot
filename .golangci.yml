@@ -1,0 +1,32 @@
+# golangci-lint config for purge-bot (v2)
+# https://golangci-lint.run/usage/configuration/
+version: "2"
+
+run:
+  timeout: 2m
+  modules-download-mode: readonly
+  # So editor (vscode-go) diagnostics map correctly when linter runs from file or package dir
+  relative-path-mode: wd
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - sloglint
+    - errorlint
+    - bodyclose
+    - unparam
+    - gosec
+    - noctx
+  settings:
+    govet:
+      enable:
+        - shadow
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -70,7 +70,8 @@ func main() {
 		log.Fatal("Error opening database: ", err)
 	}
 
-	if err := db.AutoMigrate(&bot.Task{}, &bot.ThreadCleanupTask{}, &bot.UserPermission{}, &bot.RolePermission{}); err != nil {
+	err = db.AutoMigrate(&bot.Task{}, &bot.ThreadCleanupTask{}, &bot.UserPermission{}, &bot.RolePermission{})
+	if err != nil {
 		log.Fatal("Error migrating database: ", err)
 	}
 

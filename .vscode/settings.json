@@ -1,0 +1,6 @@
+{
+  // Use golangci-lint v2 so editor linting matches CI and pre-commit (.golangci.yml)
+  "go.lintTool": "golangci-lint-v2",
+  "go.lintOnSave": "workspace",
+  "go.lintFlags": []
+}
